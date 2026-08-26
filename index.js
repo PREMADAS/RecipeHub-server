@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
@@ -29,6 +29,8 @@ const client = new MongoClient(uri);
 const database = client.db("RecipeHub");
 const featureCollection = database.collection("feature");
 const usersCollection = database.collection("users");
+const recipesCollection = database.collection("recipes");
+const reportsCollection = database.collection("reports");// Browse Recipe page এর জন্য
 
 app.get("/", (req, res) => {
     res.send("Server is running");
@@ -41,6 +43,222 @@ app.get("/api/recipes/featured", async (req, res) => {
         res.status(200).json({ recipes });
     } catch (error) {
         res.status(500).json({ error: "Failed to fetch featured recipes" });
+    }
+});
+
+
+app.get("/api/recipes", async (req, res) => {
+    try {
+        const recipes = await recipesCollection
+            .find({ status: "published" })
+            .sort({ createdAt: -1 }) // সর্বশেষ recipe আগে
+            .toArray();
+
+        res.status(200).json({ recipes });
+    } catch (error) {
+        console.error("Fetch recipes error:", error);
+        res.status(500).json({ error: "Failed to fetch recipes" });
+    }
+});
+
+app.post("/api/recipes", verifyToken, async (req, res) => {
+    try {
+        const {
+            recipeName,
+            recipeImage,
+            category,
+            cuisineType,
+            difficultyLevel,
+            preparationTime,
+            ingredients,
+            instructions,
+        } = req.body;
+
+        if (!recipeName || !recipeImage || !category || !cuisineType || !difficultyLevel || !preparationTime) {
+            return res.status(400).json({ error: "All required fields must be filled" });
+        }
+
+        if (!Array.isArray(ingredients) || ingredients.length === 0) {
+            return res.status(400).json({ error: "At least one ingredient is required" });
+        }
+
+        if (!Array.isArray(instructions) || instructions.length === 0) {
+            return res.status(400).json({ error: "At least one instruction step is required" });
+        }
+
+        const newRecipe = {
+            recipeName,
+            recipeImage,
+            category,
+            cuisineType,
+            difficultyLevel,
+            preparationTime,
+            ingredients,
+            instructions,
+            authorId: req.user.id,
+            authorName: req.user.name || "",
+            authorEmail: req.user.email,
+            likeCount: 0,
+            likedBy: [],
+            isFeatured: false,
+            status: "published",
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+
+        const result = await recipesCollection.insertOne(newRecipe);
+
+        res.status(201).json({
+            message: "Recipe added successfully",
+            recipeId: result.insertedId,
+        });
+    } catch (error) {
+        console.error("Add recipe error:", error);
+        res.status(500).json({ error: "Failed to add recipe" });
+    }
+});
+
+app.get("/api/recipes/popular", async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 8;
+
+        const recipes = await recipesCollection
+            .find({ status: "published" })
+            .sort({ likeCount: -1 })
+            .limit(limit)
+            .toArray();
+
+        res.status(200).json({ recipes });
+    } catch (error) {
+        console.error("Fetch popular recipes error:", error);
+        res.status(500).json({ error: "Failed to fetch popular recipes" });
+    }
+});
+
+// একটা নির্দিষ্ট recipe এর বিস্তারিত - View Details বাটনের জন্য
+app.get("/api/recipes/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid recipe id" });
+        }
+
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!recipe) {
+            return res.status(404).json({ error: "Recipe not found" });
+        }
+
+        res.status(200).json({ recipe });
+    } catch (error) {
+        console.error("Fetch recipe error:", error);
+        res.status(500).json({ error: "Failed to fetch recipe" });
+    }
+});
+
+
+
+// ---------- LIKE ----------
+// একজন ইউজার একবারই লাইক দিতে পারবে - likedBy array তে user id রাখা হচ্ছে
+app.post("/api/recipes/:id/like", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid id" });
+
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+        if (!recipe) return res.status(404).json({ error: "Recipe not found" });
+
+        const likedBy = recipe.likedBy || [];
+        const alreadyLiked = likedBy.some((uid) => uid === req.user.id);
+
+        const update = alreadyLiked
+            ? { $pull: { likedBy: req.user.id }, $inc: { likeCount: -1 } }
+            : { $addToSet: { likedBy: req.user.id }, $inc: { likeCount: 1 } };
+
+        await recipesCollection.updateOne({ _id: new ObjectId(id) }, update);
+        const updated = await recipesCollection.findOne({ _id: new ObjectId(id) });
+
+        res.status(200).json({ likeCount: updated.likeCount || 0, liked: !alreadyLiked });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to update like" });
+    }
+});
+
+// ---------- FAVORITE ----------
+app.post("/api/recipes/:id/favorite", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid id" });
+
+        const user = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
+        const favorites = user.favorites || [];
+        const alreadyFav = favorites.some((rid) => rid === id);
+
+        const update = alreadyFav
+            ? { $pull: { favorites: id } }
+            : { $addToSet: { favorites: id } };
+
+        await usersCollection.updateOne({ _id: new ObjectId(req.user.id) }, update);
+
+        res.status(200).json({ favorited: !alreadyFav });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to update favorite" });
+    }
+});
+
+// ---------- REPORT ----------
+app.post("/api/recipes/:id/report", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { reason } = req.body;
+
+        if (!reason) return res.status(400).json({ error: "Reason is required" });
+        if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid id" });
+
+        await reportsCollection.insertOne({
+            recipeId: id,
+            reportedBy: req.user.id,
+            reason,
+            status: "pending",
+            createdAt: new Date(),
+        });
+
+        res.status(201).json({ message: "Report submitted successfully" });
+    } catch (error) {
+        res.status(500).json({ error: "Failed to submit report" });
+    }
+});
+
+// ---------- STRIPE CHECKOUT ----------
+app.post("/api/recipes/:id/checkout", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+        if (!recipe) return res.status(404).json({ error: "Recipe not found" });
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ["card"],
+            mode: "payment",
+            line_items: [
+                {
+                    price_data: {
+                        currency: "usd",
+                        product_data: { name: recipe.title },
+                        unit_amount: Math.round(recipe.price * 100), // cents এ
+                    },
+                    quantity: 1,
+                },
+            ],
+            success_url: `${process.env.CLIENT_URL}/recipes/${id}?purchase=success`,
+            cancel_url: `${process.env.CLIENT_URL}/recipes/${id}?purchase=cancelled`,
+            metadata: { recipeId: id, userId: req.user.id },
+        });
+
+        res.status(200).json({ url: session.url });
+    } catch (error) {
+        console.error("Stripe checkout error:", error);
+        res.status(500).json({ error: "Failed to create checkout session" });
     }
 });
 
