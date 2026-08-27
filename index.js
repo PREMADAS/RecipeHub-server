@@ -5,20 +5,20 @@ import { MongoClient, ObjectId } from "mongodb";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
+import Stripe from "stripe"; // Stripe Import
 
 dotenv.config();
 
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY); // Initialize Stripe
+
 const app = express();
 
-// CORS - credentials: true লাগবে cookie পাঠানো/পাওয়ার জন্য
 app.use(
     cors({
-        origin: process.env.CLIENT_URL, // e.g. http://localhost:3000
+        origin: process.env.CLIENT_URL,
         credentials: true,
     })
 );
-app.use(express.json());
-app.use(cookieParser());
 
 const uri = process.env.MONGO_URI;
 const client = new MongoClient(uri);
@@ -27,7 +27,75 @@ const database = client.db("RecipeHub");
 const featureCollection = database.collection("feature");
 const usersCollection = database.collection("users");
 const recipesCollection = database.collection("recipes");
+const favoritesCollection = database.collection("favorites");
 const reportsCollection = database.collection("reports");
+const paymentsCollection = database.collection("payments"); // NEW: tracks confirmed Stripe payments
+
+// ---------- STRIPE WEBHOOK ----------
+// IMPORTANT: This route MUST be registered BEFORE express.json(),
+// because Stripe signature verification requires the raw request body.
+app.post(
+    "/api/webhook",
+    express.raw({ type: "application/json" }),
+    async (req, res) => {
+        const sig = req.headers["stripe-signature"];
+        let event;
+
+        try {
+            event = stripe.webhooks.constructEvent(
+                req.body,
+                sig,
+                process.env.STRIPE_WEBHOOK_SECRET
+            );
+        } catch (err) {
+            console.error("Webhook signature verification failed:", err.message);
+            return res.status(400).send(`Webhook Error: ${err.message}`);
+        }
+
+        try {
+            if (event.type === "checkout.session.completed") {
+                const session = event.data.object;
+                const { recipeId, userId } = session.metadata || {};
+
+                if (recipeId && userId) {
+                    await paymentsCollection.updateOne(
+                        { userId, recipeId },
+                        {
+                            $set: {
+                                userId,
+                                recipeId,
+                                sessionId: session.id,
+                                paymentIntentId: session.payment_intent,
+                                amount: session.amount_total,
+                                currency: session.currency,
+                                status: "paid",
+                                purchasedAt: new Date(),
+                            },
+                        },
+                        { upsert: true }
+                    );
+                } else {
+                    console.error("Webhook missing metadata:", session.id);
+                }
+            }
+
+            // Optional: handle failed/expired sessions so you can log/debug
+            if (event.type === "checkout.session.expired") {
+                console.log("Checkout session expired:", event.data.object.id);
+            }
+
+            res.status(200).json({ received: true });
+        } catch (err) {
+            console.error("Webhook handler error:", err);
+            // Respond 500 so Stripe retries delivery
+            res.status(500).json({ error: "Webhook handler failed" });
+        }
+    }
+);
+
+// All routes AFTER this line get parsed JSON bodies as normal
+app.use(express.json());
+app.use(cookieParser());
 
 app.get("/", (req, res) => {
     res.send("Server is running");
@@ -46,7 +114,7 @@ app.get("/api/recipes", async (req, res) => {
     try {
         const recipes = await recipesCollection
             .find({ status: "published" })
-            .sort({ createdAt: -1 }) // সর্বশেষ recipe আগে
+            .sort({ createdAt: -1 })
             .toArray();
 
         res.status(200).json({ recipes });
@@ -67,9 +135,17 @@ app.post("/api/recipes", verifyToken, async (req, res) => {
             preparationTime,
             ingredients,
             instructions,
+            price,
         } = req.body;
 
-        if (!recipeName || !recipeImage || !category || !cuisineType || !difficultyLevel || !preparationTime) {
+        if (
+            !recipeName ||
+            !recipeImage ||
+            !category ||
+            !cuisineType ||
+            !difficultyLevel ||
+            !preparationTime
+        ) {
             return res.status(400).json({ error: "All required fields must be filled" });
         }
 
@@ -81,6 +157,8 @@ app.post("/api/recipes", verifyToken, async (req, res) => {
             return res.status(400).json({ error: "At least one instruction step is required" });
         }
 
+        const user = await usersCollection.findOne({ email: req.user.email });
+
         const newRecipe = {
             recipeName,
             recipeImage,
@@ -90,8 +168,9 @@ app.post("/api/recipes", verifyToken, async (req, res) => {
             preparationTime,
             ingredients,
             instructions,
+            price: price ? parseFloat(price) : 9.99, // Default Price if not set
             authorId: req.user.id,
-            authorName: req.user.name || "",
+            authorName: user?.name || "Anonymous",
             authorEmail: req.user.email,
             likeCount: 0,
             likedBy: [],
@@ -130,12 +209,11 @@ app.get("/api/recipes/popular", async (req, res) => {
     }
 });
 
-// লগইন করা ইউজারের নিজের recipe গুলো - "My Recipes" dashboard section এর জন্য
 app.get("/api/recipes/mine", verifyToken, async (req, res) => {
     try {
         const recipes = await recipesCollection
             .find({ authorId: req.user.id })
-            .sort({ createdAt: -1 }) // সর্বশেষ recipe আগে
+            .sort({ createdAt: -1 })
             .toArray();
 
         res.status(200).json({ recipes });
@@ -145,7 +223,28 @@ app.get("/api/recipes/mine", verifyToken, async (req, res) => {
     }
 });
 
-// একটা নির্দিষ্ট recipe এর বিস্তারিত - View Details বাটনের জন্য
+// NEW: check whether the logged-in user has purchased a given recipe
+app.get("/api/recipes/:id/purchase-status", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid recipe id" });
+        }
+
+        const purchase = await paymentsCollection.findOne({
+            userId: req.user.id,
+            recipeId: id,
+            status: "paid",
+        });
+
+        res.status(200).json({ purchased: !!purchase });
+    } catch (error) {
+        console.error("Purchase status error:", error);
+        res.status(500).json({ error: "Failed to check purchase status" });
+    }
+});
+
 app.get("/api/recipes/:id", async (req, res) => {
     try {
         const { id } = req.params;
@@ -167,8 +266,6 @@ app.get("/api/recipes/:id", async (req, res) => {
     }
 });
 
-// ---------- DELETE RECIPE ----------
-// শুধুমাত্র ওই রেসিপির আসল লেখকই এটি ডিলিট করতে পারবে
 app.delete("/api/recipes/:id", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -177,19 +274,18 @@ app.delete("/api/recipes/:id", verifyToken, async (req, res) => {
             return res.status(400).json({ error: "Invalid recipe id" });
         }
 
-        // রেসিপিটি খোঁজা
         const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
 
         if (!recipe) {
             return res.status(404).json({ error: "Recipe not found" });
         }
 
-        // Security Check: রিকোয়েস্ট পাঠানো ইউজারের ID আর রেসিপির authorId এক কিনা
         if (recipe.authorId !== req.user.id) {
-            return res.status(403).json({ error: "Unauthorized operation. You can only delete your own recipes." });
+            return res
+                .status(403)
+                .json({ error: "Unauthorized operation. You can only delete your own recipes." });
         }
 
-        // MongoDB থেকে রেসিপি ডিলিট করা
         const result = await recipesCollection.deleteOne({ _id: new ObjectId(id) });
 
         if (result.deletedCount === 1) {
@@ -203,8 +299,6 @@ app.delete("/api/recipes/:id", verifyToken, async (req, res) => {
     }
 });
 
-// ---------- UPDATE RECIPE ----------
-// শুধুমাত্র ওই রেসিপির আসল লেখকই এটি আপডেট করতে পারবে
 app.put("/api/recipes/:id", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -217,6 +311,7 @@ app.put("/api/recipes/:id", verifyToken, async (req, res) => {
             preparationTime,
             ingredients,
             instructions,
+            price,
         } = req.body;
 
         if (!ObjectId.isValid(id)) {
@@ -229,9 +324,10 @@ app.put("/api/recipes/:id", verifyToken, async (req, res) => {
             return res.status(404).json({ error: "Recipe not found" });
         }
 
-        // Security Check: ইউজার নিজের রেসিপি আপডেট করছে কিনা
         if (recipe.authorId !== req.user.id) {
-            return res.status(403).json({ error: "Unauthorized operation. You can only update your own recipes." });
+            return res
+                .status(403)
+                .json({ error: "Unauthorized operation. You can only update your own recipes." });
         }
 
         const updatedRecipe = {
@@ -244,14 +340,12 @@ app.put("/api/recipes/:id", verifyToken, async (req, res) => {
                 preparationTime,
                 ingredients,
                 instructions,
+                price: price ? parseFloat(price) : recipe.price || 9.99,
                 updatedAt: new Date(),
             },
         };
 
-        const result = await recipesCollection.updateOne(
-            { _id: new ObjectId(id) },
-            updatedRecipe
-        );
+        await recipesCollection.updateOne({ _id: new ObjectId(id) }, updatedRecipe);
 
         res.status(200).json({ message: "Recipe updated successfully" });
     } catch (error) {
@@ -260,7 +354,6 @@ app.put("/api/recipes/:id", verifyToken, async (req, res) => {
     }
 });
 
-// ---------- LIKE ----------
 app.post("/api/recipes/:id/like", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -285,29 +378,81 @@ app.post("/api/recipes/:id/like", verifyToken, async (req, res) => {
     }
 });
 
-// ---------- FAVORITE ----------
 app.post("/api/recipes/:id/favorite", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
-        if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid id" });
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid recipe id" });
+        }
 
-        const user = await usersCollection.findOne({ _id: new ObjectId(req.user.id) });
-        const favorites = user.favorites || [];
-        const alreadyFav = favorites.some((rid) => rid === id);
+        const existingFav = await favoritesCollection.findOne({
+            userId: req.user.id,
+            recipeId: id,
+        });
 
-        const update = alreadyFav
-            ? { $pull: { favorites: id } }
-            : { $addToSet: { favorites: id } };
+        if (existingFav) {
+            await favoritesCollection.deleteOne({ _id: existingFav._id });
+            return res.status(200).json({
+                favorited: false,
+                message: "Removed from favorites",
+            });
+        } else {
+            const newFavorite = {
+                userEmail: req.user.email,
+                userId: req.user.id,
+                recipeId: id,
+                addedAt: new Date(),
+            };
 
-        await usersCollection.updateOne({ _id: new ObjectId(req.user.id) }, update);
-
-        res.status(200).json({ favorited: !alreadyFav });
+            await favoritesCollection.insertOne(newFavorite);
+            return res.status(201).json({
+                favorited: true,
+                message: "Added to favorites",
+            });
+        }
     } catch (error) {
-        res.status(500).json({ error: "Failed to update favorite" });
+        console.error("Favorite toggle error:", error);
+        res.status(500).json({ error: "Failed to update favorite status" });
     }
 });
 
-// ---------- REPORT ----------
+app.get("/api/favorites/mine", verifyToken, async (req, res) => {
+    try {
+        const userFavs = await favoritesCollection.find({ userId: req.user.id }).toArray();
+
+        if (!userFavs.length) {
+            return res.status(200).json({ recipes: [] });
+        }
+
+        const recipeIds = userFavs.map((fav) => new ObjectId(fav.recipeId));
+        const recipes = await recipesCollection.find({ _id: { $in: recipeIds } }).toArray();
+
+        res.status(200).json({ recipes });
+    } catch (error) {
+        console.error("Fetch favorites error:", error);
+        res.status(500).json({ error: "Failed to fetch favorites" });
+    }
+});
+
+app.delete("/api/favorites/:recipeId", verifyToken, async (req, res) => {
+    try {
+        const { recipeId } = req.params;
+        const result = await favoritesCollection.deleteOne({
+            userId: req.user.id,
+            recipeId: recipeId,
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ error: "Favorite item not found" });
+        }
+
+        res.status(200).json({ message: "Removed from favorites successfully" });
+    } catch (error) {
+        console.error("Remove favorite error:", error);
+        res.status(500).json({ error: "Failed to remove favorite" });
+    }
+});
+
 app.post("/api/recipes/:id/report", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -330,12 +475,30 @@ app.post("/api/recipes/:id/report", verifyToken, async (req, res) => {
     }
 });
 
-// ---------- STRIPE CHECKOUT ----------
+// ---------- STRIPE CHECKOUT ROUTE ----------
 app.post("/api/recipes/:id/checkout", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid recipe id" });
+        }
+
         const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
         if (!recipe) return res.status(404).json({ error: "Recipe not found" });
+
+        // Already purchased? Don't let them pay twice.
+        const existingPurchase = await paymentsCollection.findOne({
+            userId: req.user.id,
+            recipeId: id,
+            status: "paid",
+        });
+        if (existingPurchase) {
+            return res.status(400).json({ error: "You already own this recipe" });
+        }
+
+        const price = recipe.price || 9.99; // Fallback to 9.99 USD if price field doesn't exist
+        const name = recipe.recipeName || recipe.title || "Recipe Access";
 
         const session = await stripe.checkout.sessions.create({
             payment_method_types: ["card"],
@@ -344,13 +507,16 @@ app.post("/api/recipes/:id/checkout", verifyToken, async (req, res) => {
                 {
                     price_data: {
                         currency: "usd",
-                        product_data: { name: recipe.title },
-                        unit_amount: Math.round(recipe.price * 100),
+                        product_data: {
+                            name: name,
+                            images: recipe.recipeImage ? [recipe.recipeImage] : [],
+                        },
+                        unit_amount: Math.round(price * 100), // Stripe takes amounts in cents
                     },
                     quantity: 1,
                 },
             ],
-            success_url: `${process.env.CLIENT_URL}/recipes/${id}?purchase=success`,
+            success_url: `${process.env.CLIENT_URL}/recipes/${id}?purchase=success&session_id={CHECKOUT_SESSION_ID}`,
             cancel_url: `${process.env.CLIENT_URL}/recipes/${id}?purchase=cancelled`,
             metadata: { recipeId: id, userId: req.user.id },
         });
@@ -362,7 +528,6 @@ app.post("/api/recipes/:id/checkout", verifyToken, async (req, res) => {
     }
 });
 
-// Registration route
 app.post("/api/register", async (req, res) => {
     try {
         const { name, email, image, password } = req.body;
