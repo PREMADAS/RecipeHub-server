@@ -11,8 +11,6 @@ dotenv.config();
 const app = express();
 
 // CORS - credentials: true লাগবে cookie পাঠানো/পাওয়ার জন্য
-// origin wildcard ("*") ব্যবহার করা যাবে না যখন credentials true থাকে,
-// তাই frontend এর exact URL বসাতে হবে
 app.use(
     cors({
         origin: process.env.CLIENT_URL, // e.g. http://localhost:3000
@@ -25,17 +23,15 @@ app.use(cookieParser());
 const uri = process.env.MONGO_URI;
 const client = new MongoClient(uri);
 
-
 const database = client.db("RecipeHub");
 const featureCollection = database.collection("feature");
 const usersCollection = database.collection("users");
 const recipesCollection = database.collection("recipes");
-const reportsCollection = database.collection("reports");// Browse Recipe page এর জন্য
+const reportsCollection = database.collection("reports");
 
 app.get("/", (req, res) => {
     res.send("Server is running");
 });
-
 
 app.get("/api/recipes/featured", async (req, res) => {
     try {
@@ -45,7 +41,6 @@ app.get("/api/recipes/featured", async (req, res) => {
         res.status(500).json({ error: "Failed to fetch featured recipes" });
     }
 });
-
 
 app.get("/api/recipes", async (req, res) => {
     try {
@@ -135,6 +130,21 @@ app.get("/api/recipes/popular", async (req, res) => {
     }
 });
 
+// লগইন করা ইউজারের নিজের recipe গুলো - "My Recipes" dashboard section এর জন্য
+app.get("/api/recipes/mine", verifyToken, async (req, res) => {
+    try {
+        const recipes = await recipesCollection
+            .find({ authorId: req.user.id })
+            .sort({ createdAt: -1 }) // সর্বশেষ recipe আগে
+            .toArray();
+
+        res.status(200).json({ recipes });
+    } catch (error) {
+        console.error("Fetch my recipes error:", error);
+        res.status(500).json({ error: "Failed to fetch your recipes" });
+    }
+});
+
 // একটা নির্দিষ্ট recipe এর বিস্তারিত - View Details বাটনের জন্য
 app.get("/api/recipes/:id", async (req, res) => {
     try {
@@ -157,10 +167,100 @@ app.get("/api/recipes/:id", async (req, res) => {
     }
 });
 
+// ---------- DELETE RECIPE ----------
+// শুধুমাত্র ওই রেসিপির আসল লেখকই এটি ডিলিট করতে পারবে
+app.delete("/api/recipes/:id", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
 
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid recipe id" });
+        }
+
+        // রেসিপিটি খোঁজা
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!recipe) {
+            return res.status(404).json({ error: "Recipe not found" });
+        }
+
+        // Security Check: রিকোয়েস্ট পাঠানো ইউজারের ID আর রেসিপির authorId এক কিনা
+        if (recipe.authorId !== req.user.id) {
+            return res.status(403).json({ error: "Unauthorized operation. You can only delete your own recipes." });
+        }
+
+        // MongoDB থেকে রেসিপি ডিলিট করা
+        const result = await recipesCollection.deleteOne({ _id: new ObjectId(id) });
+
+        if (result.deletedCount === 1) {
+            res.status(200).json({ message: "Recipe deleted successfully" });
+        } else {
+            res.status(400).json({ error: "Failed to delete recipe" });
+        }
+    } catch (error) {
+        console.error("Delete recipe error:", error);
+        res.status(500).json({ error: "Failed to delete recipe" });
+    }
+});
+
+// ---------- UPDATE RECIPE ----------
+// শুধুমাত্র ওই রেসিপির আসল লেখকই এটি আপডেট করতে পারবে
+app.put("/api/recipes/:id", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const {
+            recipeName,
+            recipeImage,
+            category,
+            cuisineType,
+            difficultyLevel,
+            preparationTime,
+            ingredients,
+            instructions,
+        } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid recipe id" });
+        }
+
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(id) });
+
+        if (!recipe) {
+            return res.status(404).json({ error: "Recipe not found" });
+        }
+
+        // Security Check: ইউজার নিজের রেসিপি আপডেট করছে কিনা
+        if (recipe.authorId !== req.user.id) {
+            return res.status(403).json({ error: "Unauthorized operation. You can only update your own recipes." });
+        }
+
+        const updatedRecipe = {
+            $set: {
+                recipeName,
+                recipeImage,
+                category,
+                cuisineType,
+                difficultyLevel,
+                preparationTime,
+                ingredients,
+                instructions,
+                updatedAt: new Date(),
+            },
+        };
+
+        const result = await recipesCollection.updateOne(
+            { _id: new ObjectId(id) },
+            updatedRecipe
+        );
+
+        res.status(200).json({ message: "Recipe updated successfully" });
+    } catch (error) {
+        console.error("Update recipe error:", error);
+        res.status(500).json({ error: "Failed to update recipe" });
+    }
+});
 
 // ---------- LIKE ----------
-// একজন ইউজার একবারই লাইক দিতে পারবে - likedBy array তে user id রাখা হচ্ছে
 app.post("/api/recipes/:id/like", verifyToken, async (req, res) => {
     try {
         const { id } = req.params;
@@ -245,7 +345,7 @@ app.post("/api/recipes/:id/checkout", verifyToken, async (req, res) => {
                     price_data: {
                         currency: "usd",
                         product_data: { name: recipe.title },
-                        unit_amount: Math.round(recipe.price * 100), // cents এ
+                        unit_amount: Math.round(recipe.price * 100),
                     },
                     quantity: 1,
                 },
@@ -262,7 +362,7 @@ app.post("/api/recipes/:id/checkout", verifyToken, async (req, res) => {
     }
 });
 
-// Registration route (আগে থেকেই আছে)
+// Registration route
 app.post("/api/register", async (req, res) => {
     try {
         const { name, email, image, password } = req.body;
@@ -325,37 +425,31 @@ app.post("/api/login", async (req, res) => {
             return res.status(400).json({ error: "Email and password are required" });
         }
 
-        // ১. ইউজার খোঁজা
         const user = await usersCollection.findOne({ email: email.toLowerCase() });
         if (!user) {
             return res.status(401).json({ error: "Invalid email or password" });
         }
 
-        // ২. Blocked ইউজার চেক
         if (user.isBlocked) {
             return res.status(403).json({ error: "Your account has been blocked" });
         }
 
-        // ৩. পাসওয়ার্ড মেলানো
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
             return res.status(401).json({ error: "Invalid email or password" });
         }
 
-        // ৪. JWT টোকেন তৈরি - role সহ, যাতে পরে অ্যাডমিন চেক করা যায়
         const token = jwt.sign(
             { id: user._id, email: user.email, role: user.role },
             process.env.JWT_SECRET,
             { expiresIn: "7d" }
         );
 
-        // ৫. httpOnly cookie তে টোকেন সেট করা - JS দিয়ে (document.cookie) এটা পড়া যাবে না,
-        // তাই XSS attack থেকে সুরক্ষিত থাকে
         res.cookie("token", token, {
             httpOnly: true,
-            secure: process.env.NODE_ENV === "production", // production এ HTTPS বাধ্যতামূলক
+            secure: process.env.NODE_ENV === "production",
             sameSite: "lax",
-            maxAge: 7 * 24 * 60 * 60 * 1000, // 7 দিন (ms এ)
+            maxAge: 7 * 24 * 60 * 60 * 1000,
         });
 
         const userToReturn = {
@@ -373,7 +467,6 @@ app.post("/api/login", async (req, res) => {
     }
 });
 
-
 app.get("/api/me", verifyToken, async (req, res) => {
     try {
         const user = await usersCollection.findOne(
@@ -390,7 +483,6 @@ app.get("/api/me", verifyToken, async (req, res) => {
         return res.status(500).json({ error: "Something went wrong" });
     }
 });
-
 
 app.post("/api/logout", (req, res) => {
     res.clearCookie("token", {
@@ -410,13 +502,12 @@ function verifyToken(req, res, next) {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded; // { id, email, role } - পরের route এ req.user দিয়ে অ্যাক্সেস করা যাবে
+        req.user = decoded;
         next();
     } catch (error) {
         return res.status(401).json({ error: "Invalid or expired token" });
     }
 }
-
 
 function verifyAdmin(req, res, next) {
     if (req.user.role !== "admin") {
@@ -424,7 +515,6 @@ function verifyAdmin(req, res, next) {
     }
     next();
 }
-
 
 app.get("/api/dashboard", verifyToken, async (req, res) => {
     try {
@@ -442,7 +532,6 @@ app.get("/api/dashboard", verifyToken, async (req, res) => {
         return res.status(500).json({ error: "Something went wrong" });
     }
 });
-
 
 app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
     try {
