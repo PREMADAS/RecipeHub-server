@@ -252,18 +252,43 @@ app.get("/api/payments/session/:sessionId", verifyToken, async (req, res) => {
     try {
         const { sessionId } = req.params;
 
-        const payment = await paymentsCollection.findOne({
+        // ১. ডাটাবেজ থেকে পেমেন্ট খোঁজা
+        let payment = await paymentsCollection.findOne({
             sessionId,
-            userId: req.user.id, // ensure users can only view their own transactions
+            // userId নিশ্চিত করুন আপনার verifyToken এ কি সেট করা হচ্ছে (id নাকি _id নাকি userEmail)
+            $or: [{ userId: req.user.id }, { userId: req.user._id }, { userEmail: req.user.email }]
         });
 
+        // ২. যদি Webhook-এর দেরির কারণে ডাটাবেজে সেভ না হয়ে থাকে, তবে Stripe API থেকে সরাসরি কনফার্ম করুন
         if (!payment) {
+            try {
+                const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+                // যদি Stripe-এ পেমেন্ট পেইড হয়
+                if (session && session.payment_status === "paid") {
+                    // ঐ মুহুর্তের জন্য একটি স্ট্যান্ডার্ড রেসপন্স ব্যাকগ্রাউন্ডে স্ট্রাইপ থেকে বানিয়ে দিন
+                    return res.status(200).json({
+                        payment: {
+                            transactionId: session.payment_intent || session.id,
+                            amount: session.amount_total,
+                            currency: session.currency,
+                            status: session.payment_status,
+                            purchasedAt: new Date(session.created * 1000),
+                            recipeId: session.metadata?.recipeId || null,
+                            recipeName: session.metadata?.recipeName || null,
+                        },
+                    });
+                }
+            } catch (stripeErr) {
+                console.error("Stripe fallback fetch error:", stripeErr.message);
+            }
+
             return res.status(404).json({ error: "Transaction not found" });
         }
 
-        // Also pull the recipe name for a nicer confirmation display
+        // ৩. রেসিপির নাম খোঁজা (ডাটাবেজে পেলেই কেবল)
         let recipeName = null;
-        if (ObjectId.isValid(payment.recipeId)) {
+        if (payment.recipeId && ObjectId.isValid(payment.recipeId)) {
             const recipe = await recipesCollection.findOne(
                 { _id: new ObjectId(payment.recipeId) },
                 { projection: { recipeName: 1 } }
@@ -274,7 +299,7 @@ app.get("/api/payments/session/:sessionId", verifyToken, async (req, res) => {
         res.status(200).json({
             payment: {
                 transactionId: payment.paymentIntentId || payment.sessionId,
-                amount: payment.amount, // stored in cents (Stripe amount_total)
+                amount: payment.amount,
                 currency: payment.currency,
                 status: payment.status,
                 purchasedAt: payment.purchasedAt,
@@ -287,7 +312,6 @@ app.get("/api/payments/session/:sessionId", verifyToken, async (req, res) => {
         res.status(500).json({ error: "Failed to fetch transaction details" });
     }
 });
-
 // ---------- MY PURCHASED RECIPES: list every recipe the user has paid for ----------
 app.get("/api/payments/mine", verifyToken, async (req, res) => {
     try {
