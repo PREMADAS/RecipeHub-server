@@ -1144,11 +1144,14 @@ async function run() {
         await client.connect();
         console.log("MongoDB connected to RecipeHub");
 
-        app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        if (process.env.NODE_ENV !== "production") {
+            app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+        }
     } catch (error) {
         console.error(`MongoDB connection failed: ${error.message}`);
-        process.exit(1);
     }
 }
 
 run();
+
+export default app;
