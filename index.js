@@ -114,12 +114,28 @@ app.get("/api/recipes/featured", async (req, res) => {
 
 app.get("/api/recipes", async (req, res) => {
     try {
-        const recipes = await recipesCollection
-            .find({ status: "published" })
-            .sort({ createdAt: -1 })
-            .toArray();
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
 
-        res.status(200).json({ recipes });
+        const filter = { status: "published" };
+
+        const [recipes, totalCount] = await Promise.all([
+            recipesCollection
+                .find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray(),
+            recipesCollection.countDocuments(filter),
+        ]);
+
+        res.status(200).json({
+            recipes,
+            totalCount,
+            totalPages: Math.ceil(totalCount / limit),
+            currentPage: page,
+        });
     } catch (error) {
         console.error("Fetch recipes error:", error);
         res.status(500).json({ error: "Failed to fetch recipes" });
