@@ -742,8 +742,8 @@ app.post("/api/login", async (req, res) => {
 
         res.cookie("token", token, {
             httpOnly: true,
-            secure: process.env.NODE_ENV === "production",
-            sameSite: "lax",
+            secure: true,           // cross-site cookie e secure: true MUST thakte hবে
+            sameSite: "none",       // cross-site cookie allow korার জন্য
             maxAge: 7 * 24 * 60 * 60 * 1000,
         });
 
@@ -816,8 +816,8 @@ app.post("/api/auth/google", async (req, res) => {
 
         res.cookie("token", token, {
             httpOnly: true,
-            secure: process.env.NODE_ENV === "production",
-            sameSite: "lax",
+            secure: true,           // cross-site cookie e secure: true MUST thakte hবে
+            sameSite: "none",       // cross-site cookie allow korার জন্য
             maxAge: 7 * 24 * 60 * 60 * 1000,
         });
 
