@@ -743,7 +743,7 @@ app.post("/api/login", async (req, res) => {
         res.cookie("token", token, {
             httpOnly: true,
             secure: true,           // cross-site cookie e secure: true MUST thakte hবে
-            sameSite: "none",       // cross-site cookie allow korার জন্য
+            sameSite: "lax",       // cross-site cookie allow korার জন্য
             maxAge: 7 * 24 * 60 * 60 * 1000,
         });
 
